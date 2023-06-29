@@ -954,3 +954,150 @@ func (m *manager) workerCount() int {
 }
 ```
 
+## results Manager
+
+```go
+// Manager提供了一个探测结果缓存和更新通道。
+type Manager interface {
+	// Get返回具有给定ID的容器的缓存结果。
+	Get(kubecontainer.ContainerID) (Result, bool)
+	// Set设置具有给定ID的容器的缓存结果。
+	// Pod仅包含在更新时发送。
+	Set(kubecontainer.ContainerID, Result, *v1.Pod)
+	// Remove清除具有给定ID的容器的缓存结果。
+	Remove(kubecontainer.ContainerID)
+	// Updates创建一个通道，在其结果发生更改时接收Update（但不删除）。
+	// 注意：当前实现仅支持单个updates通道。
+	Updates() <-chan Update
+}
+```
+
+### Result
+
+```go
+// Result是探测结果的类型。
+type Result int
+
+const (
+	// Unknown被编码为-1（Result类型）
+	Unknown Result = iota - 1
+	// Success被编码为0（Result类型）
+	Success
+	// Failure被编码为1（Result类型）
+	Failure
+)
+
+func (r Result) String() string {
+	switch r {
+	case Success:
+		return "Success"
+	case Failure:
+		return "Failure"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// ToPrometheusType将Result转换为Prometheus更好理解的形式。
+func (r Result) ToPrometheusType() float64 {
+	switch r {
+	case Success:
+		return 0
+	case Failure:
+		return 1
+	default:
+		return -1
+	}
+}
+```
+
+### Update
+
+```go
+// Update是在Updates通道上发送的更新类型枚举。
+type Update struct {
+	ContainerID kubecontainer.ContainerID
+	Result      Result
+	PodUID      types.UID
+}
+```
+
+### manager
+
+```go
+// Manager的实现。
+type manager struct {
+	// 保护缓存的锁
+	sync.RWMutex
+	// 容器ID -> 探测结果的映射
+	cache map[kubecontainer.ContainerID]Result
+	// 更新通道
+	updates chan Update
+}
+
+var _ Manager = &manager{}
+
+// NewManager创建并返回一个空的结果管理器。
+func NewManager() Manager {
+	return &manager{
+		cache:   make(map[kubecontainer.ContainerID]Result),
+		updates: make(chan Update, 20),
+	}
+}
+```
+
+### Get
+
+```go
+func (m *manager) Get(id kubecontainer.ContainerID) (Result, bool) {
+	m.RLock()
+	defer m.RUnlock()
+	result, found := m.cache[id]
+	return result, found
+}
+```
+
+### Set
+
+```go
+// set的锁定部分的内部辅助函数。返回是否应该发送更新。
+func (m *manager) Set(id kubecontainer.ContainerID, result Result, pod *v1.Pod) {
+	if m.setInternal(id, result) {
+		m.updates <- Update{id, result, pod.UID}
+	}
+}
+```
+
+#### setInternal
+
+```go
+func (m *manager) setInternal(id kubecontainer.ContainerID, result Result) bool {
+	m.Lock()
+	defer m.Unlock()
+	prev, exists := m.cache[id]
+	if !exists || prev != result {
+		m.cache[id] = result
+		return true
+	}
+	return false
+}
+```
+
+### Remove
+
+```go
+func (m *manager) Remove(id kubecontainer.ContainerID) {
+	m.Lock()
+	defer m.Unlock()
+	delete(m.cache, id)
+}
+```
+
+### Updates
+
+```go
+func (m *manager) Updates() <-chan Update {
+	return m.updates
+}
+```
+
