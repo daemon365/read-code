@@ -942,6 +942,110 @@ func (r *Request) Do(ctx context.Context) Result {
 }
 ```
 
+#### request
+
+```go
+// request连接到服务器，并在接收到服务器响应时调用提供的函数。它处理重试行为和请求的预先验证。
+// 它最多调用fn一次。如果在连接到服务器之前发生问题，则返回错误 - 由提供的函数负责处理服务器错误。
+func (r *Request) request(ctx context.Context, fn func(*http.Request, *http.Response)) error {
+	// 用于统计请求总延迟的指标
+	start := time.Now()
+	defer func() {
+		metrics.RequestLatency.Observe(ctx, r.verb, r.finalURLTemplate(), time.Since(start))
+	}()
+
+	// 如果在创建请求时发生错误，直接返回该错误
+	if r.err != nil {
+		klog.V(4).Infof("Error in request: %v", r.err)
+		return r.err
+	}
+
+	// 对请求进行预检查，检查是否满足请求条件
+	if err := r.requestPreflightCheck(); err != nil {
+		return err
+	}
+
+	// 获取HTTP客户端，如果没有提供，则使用默认客户端
+	client := r.c.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	// 在设置HTTP客户端的超时之前，先对第一次尝试进行节流。我们不希望节流的客户端在发起第一次请求前就返回超时给调用者。
+	if err := r.tryThrottle(ctx); err != nil {
+		return err
+	}
+
+	// 如果设置了请求超时时间，使用context.WithTimeout创建一个新的上下文，并在请求结束后取消该上下文
+	if r.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.timeout)
+		defer cancel()
+	}
+
+	// 判断错误是否是可重试的
+	isErrRetryableFunc := func(req *http.Request, err error) bool {
+		// 对于"GET"操作，"Connection reset by peer"或者"apiserver is shutting down"通常是暂时性错误，因此我们简单地重试它们。
+		// 对于"write"操作，我们不会自动重试，因为它们不是幂等的。
+		if req.Method != "GET" {
+			return false
+		}
+		// 对于连接错误和apiserver关闭错误，我们会重试
+		if net.IsConnectionReset(err) || net.IsProbableEOF(err) {
+			return true
+		}
+		return false
+	}
+
+	// 根据最大重试次数，确定目前我们进行了多少次重试
+	retry := r.retryFn(r.maxRetries)
+	for {
+		// 在发起请求前执行重试之前的操作，例如等待指定时间间隔
+		if err := retry.Before(ctx, r); err != nil {
+			return retry.WrapPreviousError(err)
+		}
+		// 创建新的HTTP请求
+		req, err := r.newHTTPRequest(ctx)
+		if err != nil {
+			return err
+		}
+		// 执行HTTP请求，并获取响应
+		resp, err := client.Do(req)
+		// 如果请求的ContentLength>=0且请求Body不为nil且ContentLength不等于0，则记录请求的大小
+		if req.ContentLength >= 0 && !(req.Body != nil && req.ContentLength == 0) {
+			metrics.RequestSize.Observe(ctx, r.verb, r.URL().Host, float64(req.ContentLength))
+		}
+		// 在重试之后执行的操作，例如处理响应和错误
+		retry.After(ctx, r, resp, err)
+
+		// 完成请求处理的函数
+		done := func() bool {
+			defer readAndCloseResponseBody(resp)
+
+			// 如果err中有服务器返回的错误，则响应为nil。
+			f := func(req *http.Request, resp *http.Response) {
+				if resp == nil {
+					return
+				}
+				fn(req, resp)
+			}
+
+			// 判断是否需要进行下一次重试
+			if retry.IsNextRetry(ctx, r, req, resp, err, isErrRetryableFunc) {
+				return false
+			}
+
+			// 执行回调函数处理请求和响应
+			f(req, resp)
+			return true
+		}()
+		if done {
+			return retry.WrapPreviousError(err)
+		}
+	}
+}
+```
+
 ### DoRaw
 
 ```go
