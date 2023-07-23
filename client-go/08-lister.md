@@ -17,7 +17,7 @@ type NodeLister interface {
 	NodeListerExpansion
 }
 
-// NodeListerExpansion 允许将自定义方法添加到 NodeLister.
+// NodeListerExpansion 允许将自定义方法添加到 nodeLister NodeLister.
 type NodeListerExpansion interface{}
 ```
 
